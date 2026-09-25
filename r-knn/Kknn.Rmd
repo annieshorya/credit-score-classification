@@ -1,0 +1,168 @@
+---
+title: "Kknn"
+output: html_document
+date: "2025-05-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(kknn)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(pROC)
+library(smotefamily)
+
+```
+
+```{r}
+# Load data
+df <- read.csv("../data/clean_train.csv")
+df$Credit_Score <- as.factor(df$Credit_Score)
+
+```
+
+```{r}
+# Drop high-cardinality categorical columns
+df_knn <- df %>%
+  select(-Customer_ID, -Month, -Occupation, -Credit_Mix, 
+         -Payment_of_Min_Amount, -Payment_Behaviour)
+
+```
+
+```{r}
+set.seed(5003)
+
+# Separate predictors and response
+X <- df_knn[, -ncol(df_knn)]
+y <- df_knn$Credit_Score
+
+# Apply SMOTE
+smote_result <- SMOTE(X, y, K = 5)
+
+# SMOTE returns a dataframe in smote_result$data, with last column as 'class'
+df_balanced <- smote_result$data
+df_balanced$Credit_Score <- as.factor(df_balanced$class)
+df_balanced$class <- NULL  # Remove redundant column
+
+```
+
+```{r}
+# Split data into training and test sets
+set.seed(5003)
+split_idx <- createDataPartition(df_balanced$Credit_Score, p = 0.8, list = FALSE)
+train_kknn <- df_balanced[split_idx, ]
+test_kknn <- df_balanced[-split_idx, ]
+
+```
+
+```{r}
+# Scale numerical data
+preproc <- preProcess(train_kknn[, -ncol(train_kknn)], method = c("center", "scale"))
+train_scaled <- predict(preproc, train_kknn[, -ncol(train_kknn)])
+test_scaled <- predict(preproc, test_kknn[, -ncol(test_kknn)])
+
+train_scaled$Credit_Score <- train_kknn$Credit_Score
+test_scaled$Credit_Score <- test_kknn$Credit_Score
+
+```
+
+```{r}
+# Train weighted KNN using kknn
+set.seed(5003)
+kknn_model <- train.kknn(Credit_Score ~ ., data = train_scaled,
+                         ks = 1:21, kernel = "triangular", distance = 2)
+
+# View best model details
+summary(kknn_model)
+plot(kknn_model)
+
+```
+```{r}
+kknn_model
+```
+```{r}
+# Training Accuracy and Kappa
+train_pred <- predict(kknn_model, train_scaled)
+train_acc <- mean(train_pred == train_scaled$Credit_Score)
+print(paste("Training Accuracy:", round(train_acc, 4)))
+
+train_cm <- confusionMatrix(train_pred, train_scaled$Credit_Score)
+train_cm
+train_cm$overall['Kappa']
+
+```
+
+```{r}
+# Predict on test data
+pred_kknn <- predict(kknn_model, test_scaled)
+
+# Accuracy
+acc_kknn <- mean(pred_kknn == test_scaled$Credit_Score)
+print(paste("Test Accuracy:", round(acc_kknn, 4)))
+
+# Confusion Matrix
+confusionMatrix(pred_kknn, test_scaled$Credit_Score)
+
+```
+
+```{r}
+# AUC (requires numeric response)
+auc_kknn <- multiclass.roc(test_scaled$Credit_Score, as.numeric(pred_kknn))
+auc_kknn$auc
+
+```
+```{r}
+# Generate confusion matrix on test data
+cm_test <- confusionMatrix(pred_kknn, test_scaled$Credit_Score)
+
+# Extract per-class metrics
+precision <- round(cm_test$byClass[, "Precision"], 4)
+recall <- round(cm_test$byClass[, "Recall"], 4)
+f1 <- round(cm_test$byClass[, "F1"], 4)
+
+# Calculate macro-averaged scores
+macro_precision <- round(mean(precision, na.rm = TRUE), 4)
+macro_recall <- round(mean(recall, na.rm = TRUE), 4)
+macro_f1 <- round(mean(f1, na.rm = TRUE), 4)
+
+# Overall accuracy and AUC
+accuracy <- round(cm_test$overall["Accuracy"], 4)
+auc <- round(auc_kknn$auc, 4)
+
+# Create results table
+results_table <- data.frame(
+  Class = rownames(cm_test$byClass),
+  Precision = precision,
+  Recall = recall,
+  F1_Score = f1,
+  Accuracy = NA,
+  AUC = NA
+)
+
+# Append Overall/Macro row
+overall_metrics <- data.frame(
+  Class = "Overall (Macro Avg)",
+  Precision = macro_precision,
+  Recall = macro_recall,
+  F1_Score = macro_f1,
+  Accuracy = accuracy,
+  AUC = auc
+)
+
+# Final table
+results_table <- rbind(results_table, overall_metrics)
+
+# Display the table
+knitr::kable(results_table, caption = "KNN Model Performance on Test Data")
+
+```
+
+
+```{r}
+saveRDS(kknn_model, "kknn_model.rds")
+```
+

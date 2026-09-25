@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.rds
+r-knn/*.html
+# trained models from the notebook
+*.pkl

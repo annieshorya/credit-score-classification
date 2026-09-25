@@ -1,0 +1,341 @@
+---
+title: "Kknn_opt"
+output: html_document
+date: "2025-05-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(kknn)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(pROC)
+library(smotefamily)
+library(knitr)
+```
+
+# Modeling Strategy
+
+**1. Logistic Regression**  
+- Instance-based learner that adapts to local patterns and nonlinear decision boundaries using weighted distances.  
+- Works well when there’s a linear relationship between features and the log-odds of the classes.  
+
+**2. Kernel k-Nearest Neighbors (kknn)**  
+- Simple and effective for multiclass classification. Captures local data structure and doesn’t assume any distribution.  
+- Ideal for multiclass classification with no distributional assumptions, especially after balancing techniques like SMOTE.  
+
+**3. Support Vector Machines (SVM)**  
+- Performs well in high-dimensional spaces. Robust to outliers with the right kernel and effective on small- to medium-sized datasets.  
+- Suitable when data is not linearly separable — kernels like RBF help in such cases.  
+
+**4. Random Forest**  
+- An ensemble method that reduces overfitting and handles both categorical and numerical features well.  
+- Strong performance on noisy or imbalanced datasets and can handle many input variables without the need for variable deletion.  
+
+**5. Gradient Boosted Trees (XGBoost)**  
+- A state-of-the-art boosting technique with high performance and built-in regularization to prevent overfitting.  
+- Handles missing values natively and excels in structured/tabular data, such as credit scoring datasets.
+
+
+---
+# Plan for Evaluation
+
+The following metrics were used for model evaluation along with cross-validation:
+
+**Accuracy:** Gives a quick view of overall correctness, useful when class distribution is fairly balanced.  
+**Precision:** Helps reduce false positives — critical in credit scoring to avoid mistakenly approving risky profiles.  
+**Recall:** Ensures we catch most of the truly risky credit cases, minimizing false negatives.  
+**F1-Score:** Balances precision and recall, making it ideal when we care equally about both types of error, especially in imbalanced datasets.  
+**ROC-AUC:** Measures the model’s ability to separate classes across all thresholds. AUC near 1 means strong overall classification performance.  
+**Cross-Validation:** We use k-fold cross-validation to ensure our model’s performance is *reliable and generalizes well* to unseen data, avoiding overfitting or underfitting due to random train-test splits.
+
+**We chose ROC-AUC as the primary metric for determing the best model because it gives a comprehensive evaluation of the model's ability to distinguish between classes, especially important in our imbalanced, multiclass credit scoring problem. It helps ensure reliable decision-making beyond raw accuracy.**
+
+</div>
+
+---
+# Kernel K-Nearest Neighbours 
+
+```{r}
+# Load data
+df <- read.csv("../data/clean_train.csv")
+df$Credit_Score <- as.factor(df$Credit_Score)
+
+```
+
+### Modelling Process
+The kknn model is trained on a SMOTE-balanced dataset to address class imbalance.
+
+It uses the train.kknn() function to automatically perform internal cross-validation over a range of k values (1–21), and multiple kernel functions (rectangular, epanechnikov, triangular, optimal).
+
+For each kernel, the best k is selected based on lowest misclassification rate (i.e., highest accuracy).
+
+The model with triangular kernel and k=5 gave the best balance of accuracy and AUC and was chosen for final evaluation.
+
+## Data Preprocessing
+
+```{r}
+# Drop high-cardinality categorical columns
+df_knn <- df %>%
+  select(-Customer_ID, -Month, -Occupation, -Credit_Mix, 
+         -Payment_of_Min_Amount, -Payment_Behaviour)
+
+```
+
+```{r}
+set.seed(5003)
+
+# Separate predictors and response
+X <- df_knn[, -ncol(df_knn)]
+y <- df_knn$Credit_Score
+
+# Apply SMOTE
+smote_result <- SMOTE(X, y, K = 5)
+
+# Preparing balanced data
+df_balanced <- smote_result$data
+df_balanced$Credit_Score <- as.factor(df_balanced$class)
+df_balanced$class <- NULL  # Remove redundant column
+
+```
+
+```{r}
+# Split data into training and test sets
+set.seed(5003)
+split_idx <- createDataPartition(df_balanced$Credit_Score, p = 0.8, list = FALSE)
+train_kknn <- df_balanced[split_idx, ]
+test_kknn <- df_balanced[-split_idx, ]
+
+```
+
+```{r}
+# Scale numerical data
+preproc <- preProcess(train_kknn[, -ncol(train_kknn)], method = c("center", "scale"))
+train_scaled <- predict(preproc, train_kknn[, -ncol(train_kknn)])
+test_scaled <- predict(preproc, test_kknn[, -ncol(test_kknn)])
+
+train_scaled$Credit_Score <- train_kknn$Credit_Score
+test_scaled$Credit_Score <- test_kknn$Credit_Score
+
+```
+
+## Model Training to find best Model
+
+```{r}
+# Try multiple kernels
+kernels <- c("rectangular", "epanechnikov", "triangular", "optimal")
+results_list <- list()
+best_model <- NULL
+best_metric <- 0 
+best_kernel <- NULL
+
+start <- Sys.time()
+
+for (kernel in kernels) {
+  cat("\nTraining with kernel:", kernel, "\n")
+  
+  # Train model
+  set.seed(5003)
+  model <- train.kknn(Credit_Score ~ ., data = train_scaled,
+                      ks = 5:15, kernel = kernel, distance = 2)
+  
+  # Predict on test set
+  pred <- predict(model, test_scaled)
+  cm <- confusionMatrix(pred, test_scaled$Credit_Score)
+  auc <- multiclass.roc(test_scaled$Credit_Score, as.numeric(pred))$auc
+  
+  # Macro-averaged metrics
+  precision <- cm$byClass[, "Precision"]
+  recall <- cm$byClass[, "Recall"]
+  f1 <- cm$byClass[, "F1"]
+  
+  acc <- round(cm$overall["Accuracy"], 4)
+  
+  results_list[[kernel]] <- data.frame(
+    Kernel = kernel,
+    Best_K = model$best.parameters$k,
+    Accuracy = acc,
+    Kappa = round(cm$overall["Kappa"], 4),
+    Macro_Precision = round(mean(precision, na.rm = TRUE), 4),
+    Macro_Recall = round(mean(recall, na.rm = TRUE), 4),
+    Macro_F1 = round(mean(f1, na.rm = TRUE), 4),
+    AUC = round(auc, 4)
+  )
+  
+  # Check if current model is best so far
+  if (acc > best_metric) {
+    best_metric <- auc
+    best_model <- model
+    best_kernel <- kernel
+  }
+}
+
+end <- Sys.time()
+print(paste("Total optimization time:", round(end - start, 2)))
+
+# Save the best model
+saveRDS(best_model, file = "best_kknn_model.rds")
+cat("Best model saved! Kernel:", best_kernel, "Accuracy:", best_metric, "\n")
+
+
+```
+
+```{r}
+# Combine all results and display as a table
+optim_results <- do.call(rbind, results_list)
+knitr::kable(optim_results, caption = "Optimized KNN Results with Different Kernels")
+
+```
+
+```{r}
+saveRDS(model, "kknn_opt.rds")
+```
+
+## Using the best Model 
+### KNN with kernel 'Triangular' with k values ranging from 1-21
+
+```{r}
+set.seed(5003)
+kknn_model <- train.kknn(Credit_Score ~ ., data = train_scaled,
+                         ks = 1:21, kernel = "triangular", distance = 2)
+```
+
+```{r}
+best_knn <- readRDS("kknn_model.rds")
+```
+
+### KKNN - Model Performance
+
+#### training accuracy
+```{r}
+train_pred <- predict(best_knn, train_scaled)
+train_cm <- confusionMatrix(train_pred, train_scaled$Credit_Score)
+train_accuracy <- train_cm$overall["Accuracy"]
+print(paste("Train Accuracy:", round(train_accuracy, 4)))
+
+```
+#### test accuracy
+```{r}
+test_pred <- predict(best_knn, test_scaled)
+test_cm <- confusionMatrix(test_pred, test_scaled$Credit_Score)
+test_accuracy <- test_cm$overall["Accuracy"]
+print(paste("Test Accuracy:", round(test_accuracy, 4)))
+
+```
+```{r}
+# Confusion Matrix
+confusionMatrix(test_pred, test_scaled$Credit_Score)
+```
+- **Test Accuracy:** 0.83196 – strong performance on unseen data.  
+- **Training Accuracy:** 0.982 – very high, but test accuracy confirms minimal overfitting.  
+- **Precision, Recall, F1-Score:** All approximately 0.80–0.81 – indicates balanced prediction across all credit classes.  
+- **AUC-ROC:** 0.8408 – demonstrates strong ability to distinguish between classes.
+
+
+## Visualisation
+
+### Best k vs Accuracy Plot
+
+```{r}
+plot(best_knn)
+```
+
+```{r}
+# Extract misclassification as numeric vector
+misclass_vec <- as.numeric(best_knn$MISCLASS)
+
+# Create accuracy dataframe
+plot_data <- data.frame(
+  K = 1:length(misclass_vec),
+  Misclassification = misclass_vec,
+  Accuracy = 1 - misclass_vec
+)
+
+# Plot Accuracy vs K
+library(ggplot2)
+ggplot(plot_data, aes(x = K, y = Accuracy)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red", size = 2) +
+  labs(title = "Accuracy vs K (Triangular Kernel)", x = "K", y = "Accuracy") +
+  theme_minimal()
+
+```
+
+- Peak model accuracy observed at k = 5.
+- Accuracy declines after k=5, indicating loss of local sensitivity with larger k.
+
+### Confusion Matrix
+```{r}
+cm_table <- as.data.frame(test_cm$table)
+
+ggplot(cm_table, aes(Prediction, Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 5) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = "Confusion Matrix (Test Set - Triangular Kernel)", x = "Predicted", y = "Actual") +
+  theme_minimal()
+
+```
+
+### ROC Curve
+
+```{r}
+# Get predicted probabilities for each class
+prob_pred <- predict(best_knn, test_scaled, type = "prob")
+
+par(mfrow = c(1, 1))
+
+# Get actual labels
+actual <- test_scaled$Credit_Score
+
+# Create ROC for each class
+classes <- levels(actual)
+colors <- c("red", "blue", "darkgreen")
+for (i in seq_along(classes)) {
+  # Binary label for this class
+  bin_actual <- as.numeric(actual == classes[i])
+  
+  # ROC curve for this class
+  roc_i <- roc(bin_actual, prob_pred[, i])
+  
+  # Plot
+  if (i == 1) {
+    plot(roc_i, col = colors[i], main = "One-vs-Rest ROC Curves (Triangular Kernel)", lwd = 2)
+  } else {
+    lines(roc_i, col = colors[i], lwd = 2)
+  }
+}
+
+legend("bottomright", legend = paste("Class", classes), col = colors, lwd = 2)
+```
+- "Good" credit class is detected very well (high sensitivity and precision).
+- "Poor" and "Standard" classes are moderately detected — model struggles more with differentiating these.
+
+## Final Summary
+
+```{r}
+# Accuracy, precision, recall, F1
+accuracy <- test_cm$overall["Accuracy"]
+precision <- mean(test_cm$byClass[, "Precision"], na.rm = TRUE)
+recall <- mean(test_cm$byClass[, "Recall"], na.rm = TRUE)
+f1 <- mean(test_cm$byClass[, "F1"], na.rm = TRUE)
+
+# AUC using probabilities (only do this once)
+auc <- multiclass.roc(test_scaled$Credit_Score, as.numeric(test_pred))$auc
+
+# Create metrics table
+metrics_df <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1-Score", "AUC-ROC"),
+  Value = round(c(accuracy, precision, recall, f1, auc), 6)
+)
+
+# Display
+kable(metrics_df, caption = "Model Performance Metrics (Triangular Kernel)")
+
+```
+
+- The kknn model (triangular kernel) offers excellent predictive power, particularly for identifying "Good" credit scores, with robust generalization and minimal signs of overfitting.
